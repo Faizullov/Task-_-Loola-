@@ -4,6 +4,8 @@ import argparse
 import json
 import os
 import sys
+from dataclasses import replace
+from math import ceil
 from pathlib import Path
 from subprocess import CompletedProcess, TimeoutExpired
 from typing import Literal, TypedDict
@@ -28,7 +30,7 @@ from harness.skills import ConfigurationError, Skill, discover_skills
 from harness.tools import BUILTIN_TOOLS, Workspace, clip_text, format_command_result
 
 SKILLS_DIR = Path(__file__).resolve().parent / "skills"
-MAX_TURNS = 1000
+MAX_TURNS = 200
 MAX_API_RETRIES = 2
 TOOL_SCHEMAS = [
     {"type": "function", "function": tool.definition(name)} for name, tool in BUILTIN_TOOLS.items()
@@ -56,6 +58,12 @@ class AgentState(TypedDict):
     compacted_turns: int
     overflow: bool
     retried: bool
+    empty_retries: int
+    token_scale: float
+
+
+class EmptyResponseError(RuntimeError):
+    pass
 
 
 def initial_state(task: str) -> AgentState:
@@ -69,6 +77,8 @@ def initial_state(task: str) -> AgentState:
         "compacted_turns": 0,
         "overflow": False,
         "retried": False,
+        "empty_retries": 0,
+        "token_scale": 1.0,
     }
 
 
@@ -99,18 +109,29 @@ def build_agent(
         return [system_prompt, HumanMessage(content=state["task"])]
 
     def messages(state: AgentState) -> list[BaseMessage]:
-        return assemble_messages(prefix(state), state["summary"], state["history"])
+        request = assemble_messages(prefix(state), state["summary"], state["history"])
+        if state["empty_retries"]:
+            request.append(HumanMessage(content=(
+                "Your previous response was empty or incomplete. Continue the task using the available "
+                "tools, or provide a nonempty final answer if you have finished."
+            )))
+        return request
+
+    def context_budget(state: AgentState) -> ContextBudget:
+        return replace(budget, count=lambda text: ceil(budget.count(text) * state["token_scale"]))
 
     def route_context(state: AgentState) -> Literal["compact_context", "model", "__end__"]:
         if state["turns"] >= max_turns:
             return END
-        if needs_compaction(prefix(state), state["history"], state["summary"], TOOL_SCHEMAS, budget):
+        current_budget = context_budget(state)
+        if needs_compaction(prefix(state), state["history"], state["summary"], TOOL_SCHEMAS, current_budget):
             return "compact_context"
         return "model"
 
     def model_node(state: AgentState) -> dict:
+        request = messages(state)
         try:
-            response = call_model(messages(state))
+            response = call_model(request)
         except APIStatusError as error:
             if not context_overflow(error):
                 raise
@@ -120,28 +141,48 @@ def build_agent(
                     "Check LLM_CONTEXT_WINDOW and LLM_MAX_OUTPUT_TOKENS."
                 ) from error
             return {"overflow": True, "response": None}
-        return {"response": response, "turns": state["turns"] + 1, "retried": False}
+        usage = response.usage_metadata or {}
+        raw_usage = response.response_metadata.get("token_usage") or {}
+        actual = usage.get("input_tokens") or raw_usage.get("prompt_tokens")
+        token_scale = state["token_scale"]
+        if isinstance(actual, int) and actual > 0:
+            token_scale = max(token_scale, actual / max(1, budget.size(request, TOOL_SCHEMAS)))
+        incomplete = response.response_metadata.get("finish_reason") == "length"
+        empty = (
+            (not response.text.strip() or incomplete)
+            and not response.tool_calls and not response.invalid_tool_calls
+        )
+        if empty and (state["empty_retries"] >= 2 or state["turns"] + 1 >= max_turns):
+            raise EmptyResponseError("The model returned empty responses. No final answer was produced.")
+        return {
+            "response": response, "turns": state["turns"] + 1, "retried": False,
+            "empty_retries": state["empty_retries"] + 1 if empty else 0,
+            "token_scale": token_scale,
+        }
 
-    def route_response(state: AgentState) -> Literal["compact_context", "tools", "__end__"]:
+    def route_response(state: AgentState) -> Literal["compact_context", "tools", "retry_empty", "__end__"]:
         if state["overflow"]:
             return "compact_context"
         response = state["response"]
         if response and (response.tool_calls or response.invalid_tool_calls):
             return "tools"
+        if state["empty_retries"]:
+            return "retry_empty"
         return END
 
     def compact_node(state: AgentState) -> dict:
+        current_budget = context_budget(state)
         try:
             if compaction == "summary":
                 assert summarize is not None
                 remaining, summary = compact_history(
                     prefix(state), state["history"], state["summary"], TOOL_SCHEMAS,
-                    summarize, budget, force=state["overflow"], active_skills=state["active_skills"],
+                    summarize, current_budget, force=state["overflow"], active_skills=state["active_skills"],
                 )
             else:
                 remaining = trim_history(
                     prefix(state), state["history"], TOOL_SCHEMAS,
-                    budget, force=state["overflow"],
+                    current_budget, force=state["overflow"],
                 )
                 summary = ""
         except APIStatusError as error:
@@ -224,9 +265,11 @@ def build_agent(
     graph.add_node("model", model_node)
     graph.add_node("tools", tools_node)
     graph.add_node("compact_context", compact_node)
+    graph.add_node("retry_empty", lambda _state: {})
     graph.add_conditional_edges(START, route_context)
     graph.add_conditional_edges("model", route_response)
     graph.add_conditional_edges("tools", route_context)
+    graph.add_conditional_edges("retry_empty", route_context)
     graph.add_edge("compact_context", "model")
     return graph.compile().with_config({"recursion_limit": 5 * max_turns + 3})
 
@@ -235,10 +278,11 @@ def agent_loop(user_message: str, compaction: Literal["summary", "trim"] = "trim
     import tiktoken
 
     encoding = tiktoken.get_encoding(os.environ.get("LLM_TOKEN_ENCODING", "cl100k_base"))
+    history_tokens = os.environ.get("LLM_HISTORY_TOKENS")
     budget = ContextBudget(
         int(os.environ.get("LLM_CONTEXT_WINDOW", "32768")),
         int(os.environ.get("LLM_MAX_OUTPUT_TOKENS", "4096")),
-        int(os.environ.get("LLM_HISTORY_TOKENS", "16000")),
+        int(history_tokens) if history_tokens else None,
         lambda text: len(encoding.encode(text, disallowed_special=())),
     )
     max_turns = int(os.environ.get("LLM_MAX_TURNS", str(MAX_TURNS)))
@@ -303,7 +347,7 @@ def main() -> int:
     except AuthenticationError:
         print("Agent error: provider rejected credentials. Check LLM_API_KEY and LLM_BASE_URL.", file=sys.stderr)
         return 1
-    except (OpenAIError, OSError, ValueError, ConfigurationError, ContextLimitError) as error:
+    except (OpenAIError, OSError, ValueError, ConfigurationError, ContextLimitError, EmptyResponseError) as error:
         print(f"Agent error: {error}", file=sys.stderr)
         return 1
     return 0
