@@ -11,7 +11,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, Tool
 from langchain_openai import ChatOpenAI
 from openai import AuthenticationError, BadRequestError, InternalServerError
 
-from agent import MAX_API_RETRIES, SKILLS_DIR, TOOL_SCHEMAS, build_agent, cached_tokens, initial_state
+from agent import MAX_API_RETRIES, SKILLS_DIR, TOOL_SCHEMAS, EmptyResponseError, build_agent, cached_tokens, initial_state
 from harness.context import ContextBudget, ContextLimitError, assemble_messages, compact_history, trim_history
 from harness.skills import ConfigurationError, discover_skills
 from harness.tools import Workspace
@@ -196,6 +196,75 @@ class AgentTests(unittest.TestCase):
         result = self.graph(model).invoke(initial_state('Inspect'))
         self.assertEqual(result['active_skills'], ['inspect-project'])
         self.assertLessEqual(self.budget.size(assemble_messages([], '', result['history'])), 650)
+
+    def test_default_compaction_waits_for_full_request_budget(self):
+        self.budget = ContextBudget(6144, 512, None, count)
+        old_output = 'old ' * 2500
+        new_output = 'recent ' * 600
+        for mode in ('trim', 'summary'):
+            with self.subTest(mode=mode):
+                summarize = Mock(return_value=AIMessage(content='Completed the first step.'))
+                responses = iter([
+                    action('bash', {'command': 'first'}, 'old'),
+                    action('bash', {'command': 'second'}, 'new'),
+                    AIMessage(content='Done'),
+                ])
+                summary_calls_at_request = []
+
+                def respond(_messages):
+                    summary_calls_at_request.append(summarize.call_count)
+                    return next(responses)
+
+                model = Mock(side_effect=respond)
+                with patch.object(self.workspace, 'bash', side_effect=[
+                    subprocess.CompletedProcess(['first'], 0, old_output, ''),
+                    subprocess.CompletedProcess(['second'], 0, new_output, ''),
+                ]):
+                    result = self.graph(model, compaction=mode, summarize=summarize).invoke(initial_state('Run checks'))
+
+                _, second, third = [call.args[0] for call in model.call_args_list]
+                self.assertIn(old_output, second[-1].text)
+                self.assertGreater(self.budget.size(second[2:]), 2000)
+                self.assertEqual(result['compacted_turns'], 1)
+                self.assertLessEqual(self.budget.size(third, TOOL_SCHEMAS), self.budget.input_tokens)
+                self.assertEqual(third[-1].tool_call_id, 'new')
+                self.assertEqual(summary_calls_at_request[:2], [0, 0])
+                if mode == 'summary':
+                    self.assertGreater(summary_calls_at_request[-1], 0)
+                else:
+                    summarize.assert_not_called()
+
+    def test_empty_response_recovery_does_not_replay_tools(self):
+        model = Mock(side_effect=[
+            action('bash', {'command': 'echo once >> calls.txt'}),
+            AIMessage(content=''), AIMessage(content='Done'),
+        ])
+        result = self.graph(model).invoke(initial_state('Run once'))
+        self.assertEqual(result['response'].text, 'Done')
+        self.assertEqual((self.root / 'calls.txt').read_text(), 'once\n')
+        self.assertIn('previous response was empty', model.call_args_list[-1].args[0][-1].text)
+        model = Mock(return_value=AIMessage(content=''))
+        with self.assertRaises(EmptyResponseError):
+            self.graph(model).invoke(initial_state('Say done'))
+        self.assertEqual(model.call_count, 3)
+
+    def test_provider_usage_calibrates_context_before_next_request(self):
+        model = Mock(return_value=AIMessage(content='Done', usage_metadata={
+            'input_tokens': 4000, 'output_tokens': 1, 'total_tokens': 4001,
+        }))
+        result = self.graph(model).invoke(initial_state('Say done'))
+        self.assertGreater(result['token_scale'], 1)
+
+    def test_truncated_response_is_continued_instead_of_finishing(self):
+        model = Mock(side_effect=[
+            AIMessage(content='<channel|>', response_metadata={'finish_reason': 'length'}),
+            action('load_skill', {'name': 'inspect-project'}),
+            AIMessage(content='Done'),
+        ])
+        result = self.graph(model).invoke(initial_state('Inspect'))
+        self.assertEqual(result['response'].text, 'Done')
+        self.assertEqual(result['turns'], 3)
+        self.assertEqual(result['active_skills'], ['inspect-project'])
 
     def test_summary_graph_and_build_time_selection(self):
         self.budget = ContextBudget(8192, 512, 650, count)
